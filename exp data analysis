@@ -1,0 +1,105 @@
+import argparse
+import logging
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, isnan, count
+from pyspark.sql.types import NumericType
+
+# Setup Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def init_spark():
+    logging.info("==========Initializing Spark session...")
+    return SparkSession.builder.appName("DialysisBPEDA").getOrCreate()
+
+# Load the data
+def load_data(spark, input_path):
+    return spark.read.parquet(input_path)
+
+# Prints the schema
+def explore_data(df):
+    df.printSchema()
+    logging.info(f"Total rows: {df.count()}")
+
+# Check missing values
+def check_missing_values(df, output_dir=None):
+    exclude_cols = {'pid', 'session_id', 'datatime'}
+    cols_to_check = [c for c in df.columns if c not in exclude_cols]
+    total_rows = df.count()
+    missing_data = []
+    for c in cols_to_check:
+        missing_count = df.filter(col(c).isNull() | isnan(col(c))).count()
+        if missing_count > 0:
+            missing_percentage = (missing_count / total_rows) * 100
+            missing_data.append((c, missing_count, missing_percentage))
+    if missing_data:
+        spark = df.sparkSession
+        missing_df_spark = spark.createDataFrame(
+            missing_data, ["column_name", "missing_count", "missing_percentage_pct"]
+        )
+        logging.info("==========Missing value summary:")
+        missing_df_spark.show(truncate=False)
+        if output_dir:
+            output_path = f"{output_dir}/missing_values_summary"
+            missing_df_spark.write.mode("overwrite").parquet(output_path)
+        return missing_df_spark
+    else:
+        logging.info("No missing values found.")
+        return df.sparkSession.createDataFrame([], ["column_name", "missing_count", "missing_percentage_pct"])
+
+# Summary statistics
+def compute_numeric_statistics(df, output_dir=None):
+    exclude_cols_for_stats = {'pid', 'session_id', 'datatime', 'gender', 'DM'}
+    numeric_cols = [
+        field.name for field in df.schema.fields
+        if isinstance(field.dataType, NumericType) and field.name not in exclude_cols_for_stats
+    ]
+    stats_df = df.select(numeric_cols).describe()
+    logging.info("==========Basic descriptive statistics:")
+    stats_df.show()
+
+    quartile_data = []
+    if df.count() > 0:
+        for col_name in numeric_cols:
+            try:
+                q25, q50, q75 = df.stat.approxQuantile(col_name, [0.25, 0.5, 0.75], 0.01)
+                quartile_data.append((col_name, q25, q50, q75))
+            except Exception as e:
+                logging.warning(f"Could not compute quartiles for column '{col_name}': {e}")
+                quartile_data.append((col_name, float('nan'), float('nan'), float('nan')))
+    else:
+        logging.warning("DataFrame is empty.")
+
+    spark = df.sparkSession
+    quartile_df = spark.createDataFrame(quartile_data, ["column", "percentile_25", "median", "percentile_75"])
+    logging.info("==========Quartile statistics:")
+    quartile_df.show(truncate=False)
+
+    if output_dir:
+        stats_df.write.mode("overwrite").parquet(f"{output_dir}/numeric_summary_stats")
+        quartile_df.write.mode("overwrite").parquet(f"{output_dir}/numeric_quartiles")
+
+    return {"summary_stats": stats_df, "quartiles": quartile_df}
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--input", required=True, help="HDFS path to the Parquet file")
+    parser.add_argument("--output", required=True, help="HDFS directory to save EDA results")
+    args = parser.parse_args()
+
+    spark = init_spark()
+    df = load_data(spark, args.input).cache()
+
+    if df.count() == 0:
+        logging.error("Input DataFrame is empty. Exiting EDA.")
+        spark.stop()
+        return
+
+    explore_data(df)
+    check_missing_values(df, output_dir=args.output)
+    compute_numeric_statistics(df, output_dir=args.output)
+
+    df.unpersist()
+    spark.stop()
+
+if __name__ == "__main__":
+    main()

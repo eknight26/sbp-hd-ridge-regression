@@ -1,0 +1,411 @@
+
+# Preprocessing.py
+import os
+from pyspark.sql import SparkSession, Window
+from pyspark.sql.functions import (
+    col, year, to_date, to_timestamp, date_format,
+    min as spark_min, max as spark_max,
+    mean as spark_mean, first, last,
+    when, lag, unix_timestamp, substring,
+    count, sum as spark_sum, pow,
+    udf, concat_ws, expr, lit, lpad, split
+)
+from pyspark.ml.feature import Bucketizer
+from pyspark.sql.types import DoubleType, StringType
+from functools import reduce
+import argparse, traceback
+
+# ======================================
+# Class to preprocess hd1 dataset
+# ======================================
+
+# Converts fix and convert time columns, creates session features, and selects final columns
+class HDPreprocessor:
+    def __init__(self, df=None):
+        self.df = df
+    # Load data
+    def load_df(self, df):
+        self.df = df
+        return self
+    # Cast columns to double
+    def cast_to_double(self, columns):
+        for col_name in columns:
+            self.df = self.df.withColumn(col_name, col(col_name).cast("double"))
+        return self
+    # Convert date column to date type
+    def convert_to_date(self, date_col):
+        self.df = self.df.withColumn(date_col, to_date(col(date_col), "yyyy-MM-dd"))
+        return self
+    # Fix time columns, some times are not valid like 24:14 in 24-H format
+    def fix_time_columns(self, time_col):
+        df = self.df
+        df = df.withColumn(f"hour_{time_col}", substring(time_col, 1, 2).cast("int"))
+        df = df.withColumn(f"minute_{time_col}", substring(time_col, 4, 2).cast("int"))
+        df = df.withColumn(f"hour_fixed_{time_col}", when(col(f"hour_{time_col}") > 23, 23).otherwise(col(f"hour_{time_col}")))
+        df = df.withColumn(f"minute_fixed_{time_col}", when(col(f"minute_{time_col}") > 59, 59).otherwise(col(f"minute_{time_col}")))
+        df = df.withColumn(
+            f"{time_col}_fixed",
+            concat_ws(":", 
+                      lpad(col(f"hour_fixed_{time_col}").cast("string"), 2, "0"),
+                      lpad(col(f"minute_fixed_{time_col}").cast("string"), 2, "0"))
+        )
+        df = df.withColumn(f"{time_col}_timestamp", to_timestamp(col(f"{time_col}_fixed"), "HH:mm"))
+        self.df = df
+        return self
+    # Function to create a new column 'session duration' (length of treatment time)
+    def create_session_features(self):
+        self.convert_to_date("keyindate")
+        df = self.df
+        # Create session_id column using pid and keyindate
+        df = df.withColumn("session_id", concat_ws("_", col("pid").cast(StringType()), col("keyindate").cast(StringType())))
+        # Format date into string for combining with time
+        df = df.withColumn("session_date", date_format("keyindate", "yyyy-MM-dd"))
+        # Combine with fixed dialysis start/end time strings
+        df = df.withColumn("start_datetime_str", concat_ws(" ", col("session_date"), col("dialysisstart_fixed")))
+        df = df.withColumn("end_datetime_str", concat_ws(" ", col("session_date"), col("dialysisend_fixed")))
+        # Convert full datetime strings to timestamps
+        df = df.withColumn("start_time", to_timestamp("start_datetime_str", "yyyy-MM-dd HH:mm"))
+        df = df.withColumn("end_time", to_timestamp("end_datetime_str", "yyyy-MM-dd HH:mm"))
+        # Calculate session duration in minutes
+        df = df.withColumn("session_duration", (unix_timestamp("end_time") - unix_timestamp("start_time")) / 60)
+        self.df = df
+        return self
+    # Join with another DataFrame on a specified key
+    def join_with(self, other_df, join_key="pid", how="left"):
+        self.df = self.df.join(other_df, on=join_key, how=how)
+        return self
+    
+    def get_result(self):
+        return self.df
+
+# ======================================
+# Class to preprocess hd3 dataset
+# ======================================
+
+class HD3FeatureBuilder:
+    def __init__(self, df=None):
+        self.df = df
+    # Load dataset   
+    def load_df(self, df):
+        self.df = df
+        return self
+    # Convert to timestamp
+    def convert_datetime(self):
+        self.df = self.df.withColumn("datatime", to_timestamp("datatime"))
+        return self
+    # Extract target BP (last BP reading of each session)
+    def extract_targets(self):
+        self.df = self.df.withColumn("session_date", to_date("datatime"))
+        self.df = self.df.withColumn("session_id", concat_ws("_", col("pid").cast(StringType()), col("session_date").cast(StringType())))
+
+        window_session = Window.partitionBy("session_id")
+        max_time_df = self.df.withColumn("max_datatime", spark_max("datatime").over(window_session))
+        self.targets = (
+            max_time_df
+            .filter(col("datatime") == col("max_datatime"))
+            .select("session_id", "datatime", "sbp", "dbp")
+        )
+
+        # Remove the latest values from the main df (anti-join)
+        self.df = self.df.join(self.targets, on=["session_id", "datatime"], how="left_anti")
+        return self
+    # Function to create features from intra session measurements
+    def session_level_features(self):
+        # === Feature Engineering ===
+        self.df = self.df.withColumn("map", col("dbp") + ((col("sbp") - col("dbp")) / 3))
+        self.df = self.df.withColumn("pp", col("sbp") - col("dbp"))
+        self.df = self.df.withColumn("time_capped", when(col("time") > 239.9, 239.9).otherwise(col("time")))        
+        # Create time-cutoff bins
+        splits = [0.0, 60.0, 120.0, 180.0, 240]
+        # Bin labels
+        labels = ["hour1", "hour2", "hour3", "hour4"]
+        # Transform continuous numerical column into discrete bins
+        bucketizer = Bucketizer(splits=splits, inputCol="time_capped", outputCol="time_bin_index")                  
+        self.df = bucketizer.setHandleInvalid("keep").transform(self.df)
+        # Map index to a label
+        label_map = udf(lambda idx: labels[int(idx)] if idx is not None and int(idx) < len(labels) else None, StringType())
+        self.df = self.df.withColumn("time_bin", label_map("time_bin_index"))
+
+        # === Session-Level Features ===
+        df = self.df
+        window_session = Window.partitionBy("session_id").orderBy("datatime")
+
+
+        # === Construct feature on time to hypotension ===  THIS FEATURE WAS NOT USED IN THE MODEL === 
+        df = self.df
+        window_session = Window.partitionBy("session_id").orderBy("datatime")
+
+        df = (
+            df
+            .withColumn("prev_sbp", lag("sbp").over(window_session))
+            .withColumn("prev_map", lag("map").over(window_session))
+            .withColumn(
+                "hypotension",                                              # drop of systolic BP >20 mmHg or drop in MAP >10 mmHg
+                #(col("sbp") < 90) |
+                #(col("dbp") < 60) |
+                ((col("prev_sbp") - col("sbp")) > 20) |
+                ((col("prev_map") - col("map")) > 10)
+            )
+        )
+
+        session_start = df.groupBy("session_id").agg(spark_min("datatime").alias("session_start"))
+        df = df.join(session_start, on="session_id", how="left")
+        df = df.withColumn("time_from_start_min", (unix_timestamp("datatime") - unix_timestamp("session_start")) / 60)
+
+        time_to_hypo = (
+            df.filter(col("hypotension"))
+            .groupBy("pid", "session_id")
+            .agg(spark_min("time_from_start_min").alias("time_to_hypotension"))
+        )
+
+        all_sessions = df.select("pid", "session_id").distinct()
+        time_to_hypo_final = (
+            all_sessions.join(time_to_hypo, on=["pid", "session_id"], how="left")
+            .withColumn("time_to_hypotension", when(col("time_to_hypotension").isNull(), 0).otherwise(col("time_to_hypotension")))
+        )
+
+        slope_features = (
+            df.groupBy("pid", "session_id")
+            .agg(
+                count("time_from_start_min").alias("n"),
+                spark_sum("time_from_start_min").alias("sum_x"),
+                spark_sum("sbp").alias("sum_y_sbp"),
+                spark_sum("dbp").alias("sum_y_dbp"),
+                spark_sum(col("time_from_start_min") * col("sbp")).alias("sum_xy_sbp"),
+                spark_sum(col("time_from_start_min") * col("dbp")).alias("sum_xy_dbp"),
+                spark_sum(pow("time_from_start_min", 2)).alias("sum_xx")
+            )
+            .withColumn(
+                "sbp_slope",
+                when((col("n") * col("sum_xx") - pow(col("sum_x"), 2)) != 0,
+                    ((col("n") * col("sum_xy_sbp") - col("sum_x") * col("sum_y_sbp")) /
+                    (col("n") * col("sum_xx") - pow(col("sum_x"), 2)))
+                    ).otherwise(0.0)
+            )
+            .withColumn(
+                "dbp_slope",
+                when((col("n") * col("sum_xx") - pow(col("sum_x"), 2)) != 0,
+                    ((col("n") * col("sum_xy_dbp") - col("sum_x") * col("sum_y_dbp")) /
+                    (col("n") * col("sum_xx") - pow(col("sum_x"), 2)))
+                    ).otherwise(0.0)
+            )
+            .select("pid", "session_id", "sbp_slope", "dbp_slope")  # DO NOT INCLUDE time_to_hypotension TO MODEL
+        )
+
+        hd3_feat_const = time_to_hypo_final.join(slope_features, on=["pid", "session_id"], how="left")
+        # Remove extra identifier
+        hd3_feat_const = hd3_feat_const.select(
+            "session_id", "sbp_slope", "dbp_slope")
+        
+        
+        # === Construct feature on session-level measurements ===
+        # Aggregate per session measurements per time bins using means
+        bp_agg = (
+            df.groupBy("session_id", "time_bin")
+            .agg(
+                spark_mean("sbp").alias("sbp_mean"),
+                spark_mean("dbp").alias("dbp_mean"),
+                spark_mean("map").alias("map_mean"),
+                spark_mean("pp").alias("pp_mean"),
+                spark_mean("dia_temp_value").alias("dia_temp_mean"),
+                spark_mean("conductivity").alias("cond_mean"),
+                spark_mean("uf").alias("uf_mean"),
+                spark_mean("blood_flow").alias("bf_mean")
+            )
+        )
+
+        # Function to convert to wide format
+        def pivot_metric(df_in, metric):
+            pivoted = (
+                df_in.select("session_id", "time_bin", metric)
+                .groupBy("session_id")
+                .pivot("time_bin")
+                .agg(first(metric))
+            )
+            for col_name in pivoted.columns:
+                if col_name != "session_id":
+                    pivoted = pivoted.withColumnRenamed(col_name, f"{metric}_{col_name}")
+            return pivoted
+
+        metrics = [
+                "sbp_mean", "dbp_mean",
+                "map_mean", "pp_mean", 
+                "dia_temp_mean", "cond_mean",
+                "uf_mean", "bf_mean"
+        ]
+        # Pivot to wide format
+        pivot_dfs = [pivot_metric(bp_agg, m) for m in metrics]
+        hd4 = reduce(lambda d1, d2: d1.join(d2, on="session_id", how="outer"), pivot_dfs)
+        # Join with previous preprocessed datasets
+        self.session_features = hd3_feat_const.join(hd4, on="session_id", how="left")
+        self.df = self.session_features
+        return self
+
+    def get_result(self):
+        return self.session_features
+
+    def get_targets(self):
+        return self.targets
+
+
+def main():
+    # Initialise Spark session
+    spark = (
+        SparkSession
+        .builder
+        .appName("HaemodialysisPreprocessing")
+        .config("spark.sql.legacy.timeParserPolicy", "LEGACY")
+        .getOrCreate()
+    )
+
+    try:
+        # Parse command-line arguments
+        parser = argparse.ArgumentParser(description="Spark preprocessing script")
+        parser.add_argument('--input1', required=True, help="Path to hd1.csv")
+        parser.add_argument('--input2', required=True, help="Path to hd2.csv")
+        parser.add_argument('--input3', required=True, help="Path to hd3.csv")
+        parser.add_argument('--output', required=True, help="Output path for processed data")
+        args = parser.parse_args()
+
+        # Read input CSVs
+        hd1 = spark.read.option("header", True).option("inferSchema", True).csv(args.input1)
+        hd2 = spark.read.option("header", True).option("inferSchema", True).csv(args.input2)
+        hd3 = spark.read.option("header", True).option("inferSchema", True).csv(args.input3)
+
+        print("==== Preview of hd1 ====")
+        hd1.show(5)
+
+        print("==== Preview of hd2 ====")
+        hd2.show(5)
+
+        print("==== Preview of hd3 ====")
+        hd3.show(5)
+
+        # ======= Preprocess hd1 dataset ==========
+        preprocessor = HDPreprocessor()
+        hd1_final = (
+            preprocessor
+            .load_df(hd1)
+            .cast_to_double(["weightstart", "weightend", "dryweight", "temperature"])
+            .fix_time_columns("dialysisstart")
+            .fix_time_columns("dialysisend")
+            .create_session_features()
+            .get_result()
+        )
+
+        # Select final columns for this dataset
+        hd1_final = hd1_final.select(
+            "session_id", "pid", "keyindate", 
+            "dialysisstart_fixed", "dialysisend_fixed",
+            "start_time", "end_time", "session_duration",
+            "weightstart", "weightend", "dryweight", "temperature"
+        )
+        
+        
+        # ======== Preprocess hd2 dataset (Demographics Data )==========
+        # Convert hd2 columns to Spark date type
+        hd2 = hd2.withColumn("first_dialysis", to_date("first_dialysis"))
+        # Extract year from first_dialysis date
+        hd2 = hd2.withColumn("first_dialysis_year", year("first_dialysis"))
+        # Calculate age at first dialysis
+        hd2 = hd2.withColumn("age_at_first_dialysis", col("first_dialysis_year") - col("birthday"))
+        # Convert gender to binary integer
+        hd2 = hd2.withColumn(
+            "gender",
+            when(col("gender") == "M", 1)
+            .when(col("gender") == "F", 0)
+            .otherwise(lit(None))
+        )
+        # Select relevant columns
+        hd2_final = hd2.select("pid", "gender", "DM", "age_at_first_dialysis")
+        # Join with hd1_final
+        hd1_joined_hd2 = (
+            preprocessor
+            .load_df(hd1_final)
+            .join_with(hd2_final, join_key="pid", how="left")
+            .get_result()
+            )
+        # Select final columns after join
+        hd1_joined_hd2 = hd1_joined_hd2.select(
+            "pid", "session_id", "session_duration",
+            "gender", "DM", "age_at_first_dialysis",
+            "weightstart", "weightend", "dryweight", "temperature"
+        )
+        
+        # Show joined DataFrame preview
+        #hd1_joined_hd2.show(20, truncate=False)
+        
+        # ========= Preprocess hd3 dataset (Session-Level Measurements) =========
+        # Initialise class
+        hd3_builder = HD3FeatureBuilder(hd3)
+
+        hd3_wide = (
+            hd3_builder
+            .convert_datetime()
+            .extract_targets()
+            .session_level_features()
+            .get_result()
+        ).cache() 
+        print(f"hd3_wide rows: {hd3_wide.count()}")         
+
+        # Get target sbp/dbp values: TARGET
+        latest_times_df = hd3_builder.get_targets().cache() 
+        print(f"latest_times_df rows: {latest_times_df.count()}")
+        
+        # Check if DataFrames are empty
+        if hd3_wide.rdd.isEmpty():
+            print("Warning: hd3_filtered is empty. Check filtering conditions.")
+        else:
+            print("Writing hd3_filtered to 'hd3_wide.parquet'")
+            hd3_wide.write.mode("overwrite").parquet("hd3_wide.parquet")
+
+        if latest_times_df.rdd.isEmpty():
+            print("Warning: latest_times_df (target BP) is empty. Check session filtering.")
+        else:
+            print("Writing latest target BP to 'target_bp.parquet'")
+            latest_times_df.write.mode("overwrite").parquet("target_bp.parquet")
+        
+        # Join hd1_joined_hd2 with latest_times_df on session_id
+        demog_with_target = (
+            hd1_joined_hd2
+            .join(latest_times_df, on="session_id", how="left")
+        ).cache()
+        
+        # Show final joined DataFrame preview
+        demog_with_target.show(20, truncate=False)
+        
+        
+        # ========== Final Merging =========
+        final_df = (
+            demog_with_target
+            .join(hd3_wide, on="session_id", how="inner")
+        )
+        
+        # Show number of rows and columns
+        row_count = final_df.count()
+        print(f"==========Number of rows: {row_count}")
+        column_count = len(final_df.columns)
+        print(f"==========Number of columns: {column_count}")
+        
+        # Save final dataset for ML use
+        final_df.write.mode("overwrite").parquet(args.output)
+        print(f"==========Final ML-ready dataset saved to: {args.output}")
+        
+        # Unpersist after use
+        hd3_wide.unpersist()
+        latest_times_df.unpersist()
+        demog_with_target.unpersist()
+
+    except Exception as e:
+        print("==========Error during preprocessing:", str(e))
+        traceback.print_exc()
+
+    finally:
+        spark.stop()
+        print("==========Spark session stopped.")
+
+if __name__ == "__main__":
+    main()
+
+
+

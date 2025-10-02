@@ -1,0 +1,202 @@
+import argparse
+import logging
+import time
+import pandas as pd
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import col, abs,count
+from pyspark.ml.feature import VectorAssembler, StandardScaler, PCA
+from pyspark.ml.regression import LinearRegression
+from pyspark.ml.evaluation import RegressionEvaluator
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
+
+# Setup Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+def load_data(spark, file_path):
+    # Load data from a Parquet file
+    logging.info(f"==========Loading data from {file_path}...")
+    return spark.read.parquet(file_path)
+
+class LinearRegressionModel:
+    def __init__(self, train_df, test_df, label_col, feature_cols):
+        # Initialize model with training and testing data
+        self.train_df = train_df
+        self.test_df = test_df
+        self.label_col = label_col
+        self.feature_cols = feature_cols
+        self.scaler_model = None
+        self.pca_model = None
+
+    def data_preparation(self, df, scale=False, pca=False, n_components=20, fit=False):
+        # Assemble features into a single vector column
+        assembler = VectorAssembler(inputCols=self.feature_cols, outputCol="features")
+        df = assembler.transform(df)
+
+        # If PCA is requested, scaling must be applied
+        if pca and not scale:
+            scale = True
+
+        feature_col = "features"
+
+        # Apply scaling if requested
+        if scale:
+            if fit:
+                scaler = StandardScaler(inputCol="features", outputCol="scaled_features", withMean=True, withStd=True)
+                self.scaler_model = scaler.fit(df)
+            df = self.scaler_model.transform(df)
+            feature_col = "scaled_features"
+
+        # Apply PCA if requested
+        if pca:
+            if fit:
+                pca_model = PCA(k=n_components, inputCol=feature_col, outputCol="pca_features")
+                self.pca_model = pca_model.fit(df)
+            df = self.pca_model.transform(df)
+            feature_col = "pca_features"
+
+        # Show sample of transformed features, ensure the model is using the proper features (either scaled or unscaled)
+        df.select("features", feature_col).show(5, truncate=False)
+        logging.info(f"==========Using feature column: {feature_col}")
+
+        # Return DataFrame with label and final feature column
+        return df.select(col(self.label_col), col(feature_col).alias("features"))
+
+    def fit(self, scale=False, pca=False, n_components=20, reg_params=[0.1], num_folds=5):
+        # Prepare training data
+        train_df = self.data_preparation(self.train_df, scale, pca, n_components, fit=True)
+
+        # Initialize linear regression model
+        lr = LinearRegression(featuresCol="features", labelCol=self.label_col)
+
+        # Create parameter grid for cross-validation
+        param_grid = ParamGridBuilder().addGrid(lr.regParam, reg_params).build()
+        evaluator = RegressionEvaluator(predictionCol="prediction", labelCol=self.label_col, metricName="rmse")
+
+        # Setup cross-validator
+        crossval = CrossValidator(estimator=lr,
+                                  estimatorParamMaps=param_grid,
+                                  evaluator=evaluator,
+                                  numFolds=num_folds)
+
+        # Train model and measure runtime
+        start_time = time.time()
+        self.model = crossval.fit(train_df)
+        end_time = time.time()
+        self.runtime = end_time - start_time
+
+        # Log model details
+        logging.info(f"==========Model training with CV completed in {self.runtime:.2f} seconds.")
+        logging.info(f"Coefficients: {self.model.bestModel.coefficients}")
+        logging.info(f"Intercept: {self.model.bestModel.intercept}")
+        logging.info(f"Best regParam: {self.model.bestModel._java_obj.getRegParam()}")
+
+    def evaluate(self, df, scale=False, pca=False, n_components=20):
+        # Prepare data
+        df = self.data_preparation(df, scale, pca, n_components, fit=False)
+        predictions = self.model.transform(df)
+
+        # Evaluate metrics
+        evaluator_rmse = RegressionEvaluator(predictionCol="prediction", labelCol=self.label_col, metricName="rmse")
+        evaluator_mae = RegressionEvaluator(predictionCol="prediction", labelCol=self.label_col, metricName="mae")
+        evaluator_r2 = RegressionEvaluator(predictionCol="prediction", labelCol=self.label_col, metricName="r2")
+
+        rmse = evaluator_rmse.evaluate(predictions)
+        mae = evaluator_mae.evaluate(predictions)
+        r2 = evaluator_r2.evaluate(predictions)
+
+        # Select actual and predicted values for visualisation
+        result_df = predictions.select(self.label_col, "prediction")
+
+        # Save the DataFrame to CSV
+        result_df.toPandas().to_csv("predictions.csv", index=False)
+
+        # Return both metrics and result DataFrame
+        return {
+            "metrics": {"RMSE": rmse, "MAE": mae, "R2": r2},
+            "results": result_df
+        }
+
+def parse_reg_params(param_str):
+    # Convert comma-separated string to list of floats
+    return [float(p) for p in param_str.split(",")]
+
+def main():
+    label_col = "sbp"
+    feature_cols = [
+        # List of features used for training
+        "pid", "session_id", "gender", "DM", "age_at_first_dialysis", "session_duration",
+        "weightstart", "weightend", "dryweight", "temperature", "sbp_slope", "dbp_slope",
+        "sbp_mean_hour1", "sbp_mean_hour2", "sbp_mean_hour3", "sbp_mean_hour4", 
+        "dbp_mean_hour1", "dbp_mean_hour2", "dbp_mean_hour3", "dbp_mean_hour4",
+        "map_mean_hour1", "map_mean_hour2", "map_mean_hour3", "map_mean_hour4", 
+        "pp_mean_hour1", "pp_mean_hour2", "pp_mean_hour3", "pp_mean_hour4", 
+        "dia_temp_mean_hour1", "dia_temp_mean_hour2", "dia_temp_mean_hour3", "dia_temp_mean_hour4", 
+        "cond_mean_hour1", "cond_mean_hour2", "cond_mean_hour3", "cond_mean_hour4", 
+        "uf_mean_hour1", "uf_mean_hour2", "uf_mean_hour3", "uf_mean_hour4", 
+        "bf_mean_hour1", "bf_mean_hour2", "bf_mean_hour3", "bf_mean_hour4", "dbp"
+    ]
+
+    # Initialise Spark session
+    spark = SparkSession.builder.appName("RidgeRegressionSpark").getOrCreate()
+
+    # Parse command-line arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--input', required=True, help="Input path for feature data")
+    parser.add_argument('--scale', action='store_true', help="Apply feature scaling")
+    parser.add_argument('--pca', action='store_true', help="Apply PCA")
+    parser.add_argument('--regParams', default="0.1", help="Comma-separated list of regularisation values for Ridge Regression")
+    parser.add_argument('--numfolds', type=int, default=5, help="Number of folds for CV")
+    args = parser.parse_args()
+
+    # Load and final cleaning of data
+    df = load_data(spark, args.input)
+    # Remove duplicate rows
+    df = df.dropDuplicates()
+    logging.info(f"==========Total records after removing duplicates: {df.count()}")
+    # Remove rows with session_duration less than 0
+    df = df.filter(col("session_duration") >= 0)
+    logging.info(f"==========Total records after filtering session_duration < 0: {df.count()}")
+    df = df.dropna(subset=[label_col] + feature_cols)
+    df.cache()
+    logging.info(f"==========Total records after dropping nulls: {df.count()}")
+
+    # Split data by unique patient IDs to prevent leakage
+    unique_pids = df.select("pid").distinct()
+    train_pids, test_pids = unique_pids.randomSplit([0.8, 0.2], seed=427)
+
+    # Split into training and test set
+    train_df = df.join(train_pids, on="pid", how="inner").cache()
+    test_df = df.join(test_pids, on="pid", how="inner").cache()
+
+    # Drop ID columns from features
+    train_df = train_df.drop("pid", "session_id")
+    test_df = test_df.drop("pid", "session_id")
+    feature_cols = [col for col in feature_cols if col not in ["pid", "session_id"]]
+
+    # Parse regularisation parameters
+    reg_params = parse_reg_params(args.regParams)
+
+    # Train and evaluate model
+    model = LinearRegressionModel(train_df, test_df, label_col, feature_cols)
+    model.fit(scale=args.scale, pca=args.pca, reg_params=reg_params, num_folds=args.numfolds)
+    
+    # Evaluate on test and training data
+    train_results = model.evaluate(model.train_df, scale=args.scale, pca=args.pca)
+    test_results = model.evaluate(model.test_df, scale=args.scale, pca=args.pca)
+    
+    train_df.unpersist()
+    test_df.unpersist()
+    df.unpersist()
+
+    # Log evaluation metrics
+    logging.info("==========Training Set Evaluation Metrics:")
+    for metric, value in train_results["metrics"].items():
+        logging.info(f"Train {metric}: {value:.6f}")
+    logging.info("==========Test Set Evaluation Metrics:")
+    for metric, value in test_results["metrics"].items():
+        logging.info(f"Test {metric}: {value:.6f}")
+
+    logging.info(f"Model training time (seconds): {model.runtime:.2f}")
+
+if __name__ == "__main__":
+    main()
